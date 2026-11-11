@@ -1,0 +1,947 @@
+/* Lembar – scanner dokumen untuk HP. Semua diproses di perangkat. */
+(() => {
+  'use strict';
+
+  // ---------- Pengaturan ----------
+  const MAX_SIDE = 2400;     // sisi terpanjang halaman yang disimpan (px)
+  const DETECT_SIDE = 360;   // sisi terpanjang frame kecil untuk deteksi (px)
+  const STABLE_MS = 1000;    // sudut harus stabil selama ini sebelum memotret
+  const TICK_MS = 110;       // jeda antar deteksi
+  const LOST_MS = 450;       // sudut dianggap hilang setelah selama ini tak terlihat
+
+  const $ = (id) => document.getElementById(id);
+  const el = {
+    cam: $('cam'), res: $('res'), video: $('video'), overlay: $('overlay'), flash: $('flash'),
+    status: $('status'), denied: $('denied'), pick: $('pick'), hint: $('hint'), hintClose: $('hintClose'),
+    autoBtn: $('autoBtn'), shot: $('shot'), doneBtn: $('doneBtn'), count: $('count'),
+    backBtn: $('backBtn'), title: $('title'), grid: $('grid'), empty: $('empty'),
+    filters: $('filters'), name: $('name'), pdfBtn: $('pdfBtn'), zipBtn: $('zipBtn'), newBtn: $('newBtn'),
+    sheet: $('sheet'), sheetImg: $('sheetImg'), rotBtn: $('rotBtn'), delBtn: $('delBtn'), closeSheet: $('closeSheet'),
+    ready: $('ready'), readyText: $('readyText'), readyBtn: $('readyBtn'), readyClose: $('readyClose'),
+    busy: $('busy'), busyText: $('busyText')
+  };
+
+  const state = { pages: [], filter: 'asli', screen: 'cam', auto: true, nameEdited: false };
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const maxDist = (q1, q2) => Math.max(...q1.map((p, i) => dist(p, q2[i])));
+
+  // ---------- Penyimpanan (semua dibungkus try/catch) ----------
+  function lsGet(key) { try { return localStorage.getItem('lembar.' + key); } catch (e) { return null; } }
+  function lsSet(key, val) { try { localStorage.setItem('lembar.' + key, val); } catch (e) { /* abaikan */ } }
+
+  const store = {
+    db: null,
+    open() {
+      return new Promise((resolve) => {
+        try {
+          const req = indexedDB.open('lembar', 1);
+          req.onupgradeneeded = () => req.result.createObjectStore('pages', { keyPath: 'id' });
+          req.onsuccess = () => { this.db = req.result; resolve(true); };
+          req.onerror = () => resolve(false);
+          req.onblocked = () => resolve(false);
+        } catch (e) { resolve(false); }
+      });
+    },
+    run(mode, fn) {
+      return new Promise((resolve) => {
+        if (!this.db) return resolve(null);
+        try {
+          const tx = this.db.transaction('pages', mode);
+          const req = fn(tx.objectStore('pages'));
+          tx.oncomplete = () => resolve(req && req.result !== undefined ? req.result : null);
+          tx.onerror = tx.onabort = () => resolve(null);
+        } catch (e) { resolve(null); }
+      });
+    },
+    all() { return this.run('readonly', (s) => s.getAll()); },
+    put(rec) { return this.run('readwrite', (s) => s.put(rec)); },
+    del(id) { return this.run('readwrite', (s) => s.delete(id)); },
+    clear() { return this.run('readwrite', (s) => s.clear()); }
+  };
+
+  // Urutan, rotasi, dan filter disimpan terpisah (kecil), gambar di IndexedDB.
+  function saveMeta() {
+    const rot = {};
+    state.pages.forEach((p) => { if (p.rot) rot[p.id] = p.rot; });
+    lsSet('meta', JSON.stringify({ order: state.pages.map((p) => p.id), rot, filter: state.filter }));
+  }
+  function loadMeta() {
+    try { return JSON.parse(lsGet('meta')) || {}; } catch (e) { return {}; }
+  }
+
+  async function restorePages() {
+    const meta = loadMeta();
+    if (['asli', 'bw', 'tajam'].includes(meta.filter)) state.filter = meta.filter;
+    await store.open();
+    const recs = (await store.all()) || [];
+    const order = meta.order || [];
+    const rank = (id) => { const i = order.indexOf(id); return i < 0 ? 1e9 : i; };
+    recs.sort((a, b) => rank(a.id) - rank(b.id) || (a.id < b.id ? -1 : 1));
+    const old = [];
+    for (const r of recs) {
+      try {
+        old.push({
+          id: r.id, blob: new Blob([r.buf], { type: r.type || 'image/jpeg' }),
+          rot: (meta.rot && meta.rot[r.id]) || 0, thumb: null, key: ''
+        });
+      } catch (e) { /* lewati rekaman rusak */ }
+    }
+    state.pages = old.concat(state.pages);
+    updateCount(false);
+  }
+
+  let seq = 0;
+  async function addPage(blob) {
+    const p = { id: Date.now() + '-' + (seq++), blob, rot: 0, thumb: null, key: '' };
+    state.pages.push(p);
+    updateCount(true);
+    saveMeta();
+    try { await store.put({ id: p.id, buf: await blob.arrayBuffer(), type: blob.type }); } catch (e) { /* tetap di memori */ }
+  }
+
+  function updateCount(bump) {
+    el.count.textContent = state.pages.length;
+    if (bump) {
+      el.count.classList.remove('bump');
+      void el.count.offsetWidth;
+      el.count.classList.add('bump');
+    }
+  }
+
+  // ---------- Util gambar ----------
+  function toBlob(canvas, quality) {
+    return new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', quality));
+  }
+  function loadImage(blob) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(blob);
+      const im = new Image();
+      im.onload = () => { URL.revokeObjectURL(url); resolve(im); };
+      im.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Gambar tidak terbaca')); };
+      im.src = url;
+    });
+  }
+  function freeCanvas(c) { c.width = c.height = 0; }
+
+  // ---------- OpenCV: deteksi tepi & perspektif ----------
+  let cvOk = false;
+  let kernel = null;
+
+  function waitCv() {
+    const check = () => {
+      if (window.__cvFail) { setStatus(); return; }
+      const c = window.cv;
+      if (!c) return setTimeout(check, 150);
+      if (c.Mat) return cvLoaded();
+      if (typeof c.then === 'function') {
+        // Beberapa build mengembalikan Promise; jangan pernah me-resolve dengan modulnya sendiri.
+        c.then((m) => { window.cv = m; cvLoaded(); });
+        return;
+      }
+      c.onRuntimeInitialized = cvLoaded;
+    };
+    check();
+  }
+  function cvLoaded() {
+    try {
+      kernel = cv.Mat.ones(3, 3, cv.CV_8U);
+      cvOk = true;
+    } catch (e) { window.__cvFail = true; }
+    setStatus();
+  }
+
+  // Urutkan 4 titik: kiri-atas, kanan-atas, kanan-bawah, kiri-bawah.
+  function orderQuad(pts) {
+    const cx = pts.reduce((s, p) => s + p.x, 0) / 4;
+    const cy = pts.reduce((s, p) => s + p.y, 0) / 4;
+    const s = pts.slice().sort((a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx));
+    let first = 0;
+    s.forEach((p, i) => { if (p.x + p.y < s[first].x + s[first].y) first = i; });
+    return [0, 1, 2, 3].map((i) => s[(first + i) % 4]);
+  }
+
+  function bestQuad(bin, w, h) {
+    const contours = new cv.MatVector();
+    const hier = new cv.Mat();
+    let best = null, bestArea = 0;
+    try {
+      cv.findContours(bin, contours, hier, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+      const minArea = w * h * 0.12, maxArea = w * h * 0.97;
+      for (let i = 0; i < contours.size(); i++) {
+        const c = contours.get(i);
+        const area = cv.contourArea(c, false);
+        if (area > minArea && area < maxArea && area > bestArea) {
+          const ap = new cv.Mat();
+          cv.approxPolyDP(c, ap, 0.02 * cv.arcLength(c, true), true);
+          if (ap.rows === 4 && cv.isContourConvex(ap)) {
+            const d = ap.data32S;
+            best = [0, 1, 2, 3].map((j) => ({ x: d[j * 2], y: d[j * 2 + 1] }));
+            bestArea = area;
+          }
+          ap.delete();
+        }
+        c.delete();
+      }
+    } finally { contours.delete(); hier.delete(); }
+    return best ? orderQuad(best) : null;
+  }
+
+  // Cari kertas di frame kecil. Mengembalikan { quad | null, sig } (sig = salinan abu-abu untuk membandingkan frame).
+  function detect(img) {
+    const w = img.width, h = img.height;
+    const src = cv.matFromImageData(img);
+    const gray = new cv.Mat();
+    const bin = new cv.Mat();
+    let quad = null, sig = null;
+    try {
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
+      cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+      sig = new Uint8Array(gray.data);
+      cv.Canny(gray, bin, 60, 160, 3, false);
+      cv.dilate(bin, bin, kernel, new cv.Point(-1, -1), 1, cv.BORDER_CONSTANT, cv.morphologyDefaultBorderValue());
+      quad = bestQuad(bin, w, h);
+      if (!quad) {
+        // Cadangan: kertas terang di atas latar gelap.
+        cv.threshold(gray, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+        quad = bestQuad(bin, w, h);
+      }
+    } finally { src.delete(); gray.delete(); bin.delete(); }
+    return { quad, sig };
+  }
+
+  // Bagian piksel yang berubah jauh di antara dua frame kecil (0..1).
+  function changed(a, b) {
+    if (!a || !b || a.length !== b.length) return 1;
+    let n = 0, total = 0;
+    for (let i = 0; i < a.length; i += 3) {
+      total++;
+      const d = a[i] - b[i];
+      if (d > 30 || d < -30) n++;
+    }
+    return n / total;
+  }
+
+  // Potong & luruskan dari canvas resolusi penuh. quad dalam koordinat canvas.
+  function warp(canvas, quad) {
+    const [tl, tr, br, bl] = quad;
+    let W = Math.max(dist(tl, tr), dist(bl, br));
+    let H = Math.max(dist(tl, bl), dist(tr, br));
+    const s = Math.min(1, MAX_SIDE / Math.max(W, H));
+    W = Math.round(W * s); H = Math.round(H * s);
+    if (W < 60 || H < 60) throw new Error('quad terlalu kecil');
+    const ctx = canvas.getContext('2d');
+    const src = cv.matFromImageData(ctx.getImageData(0, 0, canvas.width, canvas.height));
+    const a = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y]);
+    const b = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, W, 0, W, H, 0, H]);
+    const dst = new cv.Mat();
+    let M = null;
+    try {
+      M = cv.getPerspectiveTransform(a, b);
+      cv.warpPerspective(src, dst, M, new cv.Size(W, H), cv.INTER_LINEAR, cv.BORDER_REPLICATE, new cv.Scalar());
+      const out = document.createElement('canvas');
+      out.width = W; out.height = H;
+      out.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(dst.data), W, H), 0, 0);
+      return out;
+    } finally { src.delete(); a.delete(); b.delete(); dst.delete(); if (M) M.delete(); }
+  }
+
+  // ---------- Kamera ----------
+  const small = document.createElement('canvas');
+  const sctx = small.getContext('2d', { willReadFrequently: true });
+  const full = document.createElement('canvas');
+  const fctx = full.getContext('2d', { willReadFrequently: true });
+  const octx = el.overlay.getContext('2d');
+
+  let stream = null, starting = false, camDenied = false, busy = false;
+
+  // Status pelacakan kertas
+  const T = { quad: null, shown: null, anchor: null, since: 0, lastSeen: 0, locked: false, lockSig: null, lockQuad: null, chg: 0, prog: 0 };
+
+  async function startCam() {
+    if (stream || starting) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { showDenied(); return; }
+    starting = true;
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 2560 }, height: { ideal: 1440 } }
+      });
+      if (state.screen !== 'cam' || document.hidden) { s.getTracks().forEach((t) => t.stop()); return; }
+      stream = s;
+      camDenied = false;
+      el.denied.hidden = true;
+      el.video.srcObject = s;
+      try { await el.video.play(); } catch (e) { /* autoplay akan menyusul */ }
+    } catch (e) {
+      showDenied();
+    } finally {
+      starting = false;
+      setStatus();
+    }
+  }
+  function stopCam() {
+    if (stream) {
+      stream.getTracks().forEach((t) => t.stop());
+      stream = null;
+      el.video.srcObject = null;
+    }
+    T.quad = T.shown = T.anchor = null;
+    octx.clearRect(0, 0, el.overlay.width, el.overlay.height);
+  }
+  function showDenied() {
+    camDenied = true;
+    el.denied.hidden = false;
+    el.hint.hidden = true;
+    setStatus();
+  }
+
+  function setStatus(text) {
+    if (!text) {
+      if (camDenied) text = 'Kamera tidak tersedia';
+      else if (!stream) text = 'Menyiapkan kamera…';
+      else if (window.__cvFail) text = 'Deteksi tepi tidak tersedia · potret manual';
+      else if (!cvOk) text = 'Memuat detektor tepi…';
+      else if (T.locked) text = 'Tersimpan ✓ · ganti kertas';
+      else if (!state.auto) text = T.quad ? 'Kertas terdeteksi · potret manual' : 'Mode manual';
+      else if (T.quad) text = 'Tahan sebentar…';
+      else text = 'Arahkan kamera ke kertas';
+    }
+    if (el.status.textContent !== text) el.status.textContent = text;
+  }
+
+  function smallSize(w, h) {
+    const k = DETECT_SIDE / Math.max(w, h);
+    return { k, w: Math.max(1, Math.round(w * k)), h: Math.max(1, Math.round(h * k)) };
+  }
+
+  function tick() {
+    setTimeout(tick, TICK_MS);
+    if (state.screen !== 'cam' || !stream || busy || document.hidden) return;
+    const vw = el.video.videoWidth, vh = el.video.videoHeight;
+    if (!vw || el.video.readyState < 2) return;
+    if (!cvOk) { setStatus(); return; }
+    const s = smallSize(vw, vh);
+    if (small.width !== s.w || small.height !== s.h) { small.width = s.w; small.height = s.h; }
+    let d;
+    try {
+      sctx.drawImage(el.video, 0, 0, s.w, s.h);
+      d = detect(sctx.getImageData(0, 0, s.w, s.h));
+    } catch (e) { return; }
+    track(d, s.w, s.h);
+  }
+
+  function track(d, sw, sh) {
+    const now = performance.now();
+    const tol = Math.max(sw, sh) * 0.03;
+    const q = d.quad;
+
+    if (q) {
+      T.lastSeen = now;
+      T.quad = q;
+      T.shown = T.shown
+        ? T.shown.map((p, i) => ({ x: p.x + (q[i].x - p.x) * 0.6, y: p.y + (q[i].y - p.y) * 0.6 }))
+        : q;
+      if (!T.anchor || maxDist(q, T.anchor) > tol) { T.anchor = q; T.since = now; }
+    } else if (now - T.lastSeen > LOST_MS) {
+      T.quad = T.shown = T.anchor = null;
+    }
+
+    // Terkunci sampai kertas berganti: sudut hilang, atau isi frame berubah jauh.
+    if (T.locked) {
+      T.chg = changed(d.sig, T.lockSig) > 0.25 ? T.chg + 1 : 0;
+      if (!T.quad || T.chg >= 3) {
+        T.locked = false;
+        T.chg = 0;
+        T.anchor = null;
+      }
+    }
+
+    T.prog = 0;
+    if (state.auto && !T.locked && T.quad && T.anchor) {
+      T.prog = Math.min(1, (now - T.since) / STABLE_MS);
+      if (T.prog >= 1) {
+        const same = T.lockSig && T.lockQuad &&
+          changed(d.sig, T.lockSig) < 0.015 && maxDist(T.quad, T.lockQuad) < tol;
+        if (same) T.locked = true;      // pemandangan persis sama: kertas yang tadi, jangan dipotret lagi
+        else capture();
+      }
+    }
+
+    drawOverlay(sw);
+    setStatus();
+  }
+
+  function drawOverlay(sw) {
+    const ov = el.overlay;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const cw = Math.round(ov.clientWidth * dpr), ch = Math.round(ov.clientHeight * dpr);
+    if (ov.width !== cw || ov.height !== ch) { ov.width = cw; ov.height = ch; }
+    octx.clearRect(0, 0, cw, ch);
+    const q = T.shown;
+    const vw = el.video.videoWidth, vh = el.video.videoHeight;
+    if (!q || !vw) return;
+    // Petakan frame kecil -> video -> layar (object-fit: cover)
+    const s = Math.max(cw / vw, ch / vh);
+    const ox = (cw - vw * s) / 2, oy = (ch - vh * s) / 2;
+    const k = (vw / sw) * s;
+    octx.beginPath();
+    q.forEach((p, i) => {
+      const x = ox + p.x * k, y = oy + p.y * k;
+      if (i) octx.lineTo(x, y); else octx.moveTo(x, y);
+    });
+    octx.closePath();
+    const color = T.locked ? '147,160,177' : (T.prog > 0 ? '45,212,167' : '255,255,255');
+    octx.fillStyle = `rgba(${color},${T.locked ? 0.12 : 0.1 + 0.25 * T.prog})`;
+    octx.fill();
+    octx.lineJoin = 'round';
+    octx.lineWidth = (T.locked ? 2 : 3 + 3 * T.prog) * dpr;
+    octx.setLineDash(T.locked ? [10 * dpr, 8 * dpr] : []);
+    octx.strokeStyle = `rgb(${color})`;
+    octx.stroke();
+  }
+
+  // Bunyi, kedip, getar
+  let actx = null;
+  function initAudio() {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!actx && AC) actx = new AC();
+      if (actx && actx.state === 'suspended') actx.resume();
+    } catch (e) { /* tanpa bunyi */ }
+  }
+  function feedback() {
+    el.flash.classList.remove('on');
+    void el.flash.offsetWidth;
+    el.flash.classList.add('on');
+    try { if (navigator.vibrate) navigator.vibrate(30); } catch (e) { /* abaikan */ }
+    try {
+      if (!actx || actx.state !== 'running') return;
+      const t = actx.currentTime;
+      const osc = actx.createOscillator(), gain = actx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(1320, t);
+      gain.gain.setValueAtTime(0.25, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+      osc.connect(gain).connect(actx.destination);
+      osc.start(t);
+      osc.stop(t + 0.1);
+    } catch (e) { /* abaikan */ }
+  }
+
+  // Cari kertas di canvas resolusi penuh; kembalikan quad dalam koordinat canvas itu.
+  function findQuad(canvas) {
+    const s = smallSize(canvas.width, canvas.height);
+    small.width = s.w; small.height = s.h;
+    sctx.drawImage(canvas, 0, 0, s.w, s.h);
+    const d = detect(sctx.getImageData(0, 0, s.w, s.h));
+    return { smallQuad: d.quad, sig: d.sig, k: s.k };
+  }
+
+  async function capture() {
+    if (busy || !stream) return;
+    const vw = el.video.videoWidth, vh = el.video.videoHeight;
+    if (!vw) return;
+    busy = true;
+    try {
+      full.width = vw; full.height = vh;
+      fctx.drawImage(el.video, 0, 0, vw, vh);
+
+      let smallQuad = null, sig = null, quad = null;
+      if (cvOk) {
+        try {
+          const f = findQuad(full);     // deteksi ulang tepat di frame yang dipotret
+          sig = f.sig;
+          smallQuad = f.smallQuad || (T.quad && performance.now() - T.lastSeen < 600 ? T.quad : null);
+          if (smallQuad) quad = smallQuad.map((p) => ({ x: p.x / f.k, y: p.y / f.k }));
+        } catch (e) { quad = null; }
+      }
+
+      feedback();
+
+      let out = full;
+      if (quad) { try { out = warp(full, quad); } catch (e) { out = full; } }  // gagal -> simpan foto utuh
+      const blob = await toBlob(out, 0.9);
+      if (out !== full) freeCanvas(out);
+      if (blob) await addPage(blob);
+
+      T.locked = true;
+      T.lockSig = sig;
+      T.lockQuad = smallQuad;
+      T.anchor = null;
+      T.chg = 0;
+      setStatus();
+    } finally {
+      busy = false;
+    }
+  }
+
+  // Foto dari galeri (dipakai kalau kamera ditolak)
+  async function importFiles(files) {
+    if (!files.length) return;
+    showBusy('Memproses foto…');
+    let ok = 0;
+    for (let i = 0; i < files.length; i++) {
+      el.busyText.textContent = `Memproses foto ${i + 1}/${files.length}…`;
+      try {
+        const im = await loadImage(files[i]);
+        const s = Math.min(1, 3000 / Math.max(im.naturalWidth, im.naturalHeight));
+        const c = document.createElement('canvas');
+        c.width = Math.round(im.naturalWidth * s);
+        c.height = Math.round(im.naturalHeight * s);
+        c.getContext('2d', { willReadFrequently: true }).drawImage(im, 0, 0, c.width, c.height);
+        let out = c;
+        if (cvOk) {
+          try {
+            const f = findQuad(c);
+            if (f.smallQuad) out = warp(c, f.smallQuad.map((p) => ({ x: p.x / f.k, y: p.y / f.k })));
+          } catch (e) { out = c; }
+        }
+        const blob = await toBlob(out, 0.9);
+        if (out !== c) freeCanvas(out);
+        freeCanvas(c);
+        if (blob) { await addPage(blob); ok++; }
+      } catch (e) { /* lewati file yang gagal */ }
+      await sleep(0);
+    }
+    hideBusy();
+    if (ok) show('res');
+  }
+
+  // ---------- Filter (JavaScript murni, jalan walau OpenCV belum termuat) ----------
+  function toGray(d) {
+    const n = d.width * d.height, px = d.data, g = new Uint8Array(n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) g[i] = (px[j] * 77 + px[j + 1] * 150 + px[j + 2] * 29) >> 8;
+    return g;
+  }
+  // Rata-rata lokal (kotak radius r) lewat integral image.
+  function meanMap(g, w, h, r) {
+    const W = w + 1, I = new Uint32Array(W * (h + 1)), m = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      let row = 0;
+      const o = (y + 1) * W, po = y * W, go = y * w;
+      for (let x = 0; x < w; x++) { row += g[go + x]; I[o + x + 1] = I[po + x + 1] + row; }
+    }
+    for (let y = 0; y < h; y++) {
+      const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+      for (let x = 0; x < w; x++) {
+        const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
+        m[y * w + x] = (I[y1 * W + x1] - I[y0 * W + x1] - I[y1 * W + x0] + I[y0 * W + x0]) / ((x1 - x0) * (y1 - y0));
+      }
+    }
+    return m;
+  }
+  // Hitam-putih: ambang adaptif, tahan terhadap bayangan.
+  function filterBW(d) {
+    const w = d.width, h = d.height, px = d.data;
+    const g = toGray(d), m = meanMap(g, w, h, Math.max(8, w >> 4));
+    for (let i = 0, j = 0; i < g.length; i++, j += 4) {
+      const v = g[i] < m[i] * 0.88 ? 0 : 255;
+      px[j] = px[j + 1] = px[j + 2] = v;
+    }
+  }
+  // Tajam: ratakan pencahayaan, naikkan kontras, pertajam tepi huruf.
+  function filterSharp(d) {
+    const w = d.width, h = d.height, px = d.data;
+    const g = toGray(d), m = meanMap(g, w, h, Math.max(12, (Math.max(w, h) / 14) | 0));
+    for (let i = 0, j = 0; i < g.length; i++, j += 4) {
+      const gain = Math.max(1, Math.min(2.5, 242 / Math.max(m[i], 48)));
+      px[j] = (px[j] * gain - 128) * 1.12 + 128;
+      px[j + 1] = (px[j + 1] * gain - 128) * 1.12 + 128;
+      px[j + 2] = (px[j + 2] * gain - 128) * 1.12 + 128;
+    }
+    const src = new Uint8ClampedArray(px);
+    const row = w * 4;
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const j = (y * w + x) * 4;
+        for (let c = 0; c < 3; c++) {
+          const k = j + c;
+          px[k] = src[k] + 0.5 * (4 * src[k] - src[k - 4] - src[k + 4] - src[k - row] - src[k + row]);
+        }
+      }
+    }
+  }
+
+  // Gambar satu halaman (rotasi + filter) ke canvas baru.
+  async function renderPage(p, maxSide) {
+    const im = await loadImage(p.blob);
+    const s = Math.min(1, maxSide / Math.max(im.naturalWidth, im.naturalHeight));
+    const w = Math.max(1, Math.round(im.naturalWidth * s)), h = Math.max(1, Math.round(im.naturalHeight * s));
+    const side = p.rot % 180 !== 0;
+    const c = document.createElement('canvas');
+    c.width = side ? h : w;
+    c.height = side ? w : h;
+    const ctx = c.getContext('2d', { willReadFrequently: state.filter !== 'asli' });
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.translate(c.width / 2, c.height / 2);
+    ctx.rotate(p.rot * Math.PI / 180);
+    ctx.drawImage(im, -w / 2, -h / 2, w, h);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    if (state.filter !== 'asli') {
+      const d = ctx.getImageData(0, 0, c.width, c.height);
+      (state.filter === 'bw' ? filterBW : filterSharp)(d);
+      ctx.putImageData(d, 0, 0);
+    }
+    return c;
+  }
+
+  // ---------- Layar hasil ----------
+  function show(screen) {
+    state.screen = screen;
+    el.cam.hidden = screen !== 'cam';
+    el.res.hidden = screen !== 'res';
+    if (screen === 'cam') {
+      startCam();
+    } else {
+      stopCam();
+      if (!state.nameEdited || !el.name.value.trim()) { el.name.value = defaultName(); state.nameEdited = false; }
+      renderGrid();
+    }
+  }
+
+  function defaultName() {
+    const d = new Date(), z = (n) => String(n).padStart(2, '0');
+    return `Scan_${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}_${z(d.getHours())}${z(d.getMinutes())}`;
+  }
+  function fileBase() {
+    const n = el.name.value.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '').replace(/\.(pdf|zip)$/i, '').trim();
+    return n || defaultName();
+  }
+
+  function renderGrid() {
+    const n = state.pages.length;
+    el.title.textContent = n ? `Hasil · ${n} halaman` : 'Hasil';
+    el.empty.hidden = n > 0;
+    el.grid.hidden = n === 0;
+    el.pdfBtn.disabled = el.zipBtn.disabled = n === 0;
+    [...el.filters.children].forEach((b) => b.setAttribute('aria-checked', String(b.dataset.f === state.filter)));
+    el.grid.textContent = '';
+    for (const p of state.pages) {
+      const div = document.createElement('div');
+      div.className = 'page';
+      div.dataset.id = p.id;
+      const img = document.createElement('img');
+      img.alt = '';
+      img.draggable = false;
+      if (p.thumb) img.src = p.thumb;
+      div.appendChild(img);
+      el.grid.appendChild(div);
+    }
+    refreshThumbs();
+  }
+
+  let thumbGen = 0;
+  async function refreshThumbs() {
+    const gen = ++thumbGen;
+    for (const p of state.pages.slice()) {
+      const key = state.filter + ':' + p.rot;
+      if (p.thumb && p.key === key) continue;
+      try {
+        const c = await renderPage(p, 420);
+        const b = await toBlob(c, 0.8);
+        freeCanvas(c);
+        if (gen !== thumbGen) return;
+        if (p.thumb) URL.revokeObjectURL(p.thumb);
+        p.thumb = URL.createObjectURL(b);
+        p.key = key;
+        const node = [...el.grid.children].find((n) => n.dataset.id === p.id);
+        if (node) node.firstChild.src = p.thumb;
+        if (sheetPage === p) el.sheetImg.src = p.thumb;
+      } catch (e) { /* lewati */ }
+    }
+  }
+
+  // Lembar aksi: putar / hapus
+  let sheetPage = null;
+  function openSheet(p) {
+    sheetPage = p;
+    el.sheetImg.src = p.thumb || '';
+    el.sheet.hidden = false;
+  }
+  function closeSheet() { sheetPage = null; el.sheet.hidden = true; }
+
+  function rotatePage() {
+    if (!sheetPage) return;
+    sheetPage.rot = (sheetPage.rot + 90) % 360;
+    saveMeta();
+    refreshThumbs();
+  }
+  function deletePage() {
+    const p = sheetPage;
+    if (!p) return;
+    state.pages = state.pages.filter((x) => x !== p);
+    if (p.thumb) URL.revokeObjectURL(p.thumb);
+    store.del(p.id);
+    saveMeta();
+    updateCount(false);
+    closeSheet();
+    renderGrid();
+  }
+
+  // Ketuk = buka aksi; tahan lalu seret = ubah urutan.
+  function bindGrid() {
+    let item = null, sx = 0, sy = 0, gx = 0, gy = 0, timer = 0, drag = false, moved = false, ghost = null;
+
+    const start = (x, y, target) => {
+      item = target.closest ? target.closest('.page') : null;
+      if (!item) return;
+      sx = x; sy = y; moved = false; drag = false;
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (!item || moved) return;
+        drag = true;
+        const r = item.getBoundingClientRect();
+        gx = sx - r.left; gy = sy - r.top;
+        ghost = item.cloneNode(true);
+        ghost.classList.add('ghost');
+        ghost.style.width = r.width + 'px';
+        ghost.style.height = r.height + 'px';
+        ghost.style.left = r.left + 'px';
+        ghost.style.top = r.top + 'px';
+        document.body.appendChild(ghost);
+        item.classList.add('placeholder');
+        try { if (navigator.vibrate) navigator.vibrate(15); } catch (e) { /* abaikan */ }
+      }, 380);
+    };
+
+    const move = (x, y, ev) => {
+      if (!item) return;
+      if (!drag) {
+        if (Math.hypot(x - sx, y - sy) > 10) { moved = true; clearTimeout(timer); }
+        return;
+      }
+      if (ev.cancelable) ev.preventDefault();   // cegah layar ikut bergulir saat menyeret
+      ghost.style.left = (x - gx) + 'px';
+      ghost.style.top = (y - gy) + 'px';
+      const under = document.elementFromPoint(x, y);
+      const over = under && under.closest ? under.closest('.page') : null;
+      if (over && over !== item && over.parentNode === el.grid) {
+        const kids = [...el.grid.children];
+        if (kids.indexOf(over) > kids.indexOf(item)) over.after(item); else over.before(item);
+      }
+      const gr = el.grid.getBoundingClientRect();
+      if (y < gr.top + 50) el.grid.scrollTop -= 14;
+      else if (y > gr.bottom - 50) el.grid.scrollTop += 14;
+    };
+
+    const end = (cancel) => {
+      clearTimeout(timer);
+      if (!item) return;
+      const cur = item;
+      item = null;
+      if (drag) {
+        drag = false;
+        if (ghost) { ghost.remove(); ghost = null; }
+        cur.classList.remove('placeholder');
+        const ids = [...el.grid.children].map((n) => n.dataset.id);
+        state.pages.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
+        saveMeta();
+      } else if (!moved && !cancel) {
+        const p = state.pages.find((x) => x.id === cur.dataset.id);
+        if (p) openSheet(p);
+      }
+    };
+
+    el.grid.addEventListener('touchstart', (e) => {
+      if (e.touches.length === 1) start(e.touches[0].clientX, e.touches[0].clientY, e.target);
+    }, { passive: true });
+    el.grid.addEventListener('touchmove', (e) => move(e.touches[0].clientX, e.touches[0].clientY, e), { passive: false });
+    el.grid.addEventListener('touchend', (e) => {
+      if (item && e.cancelable) e.preventDefault();   // jangan sampai jadi klik ganda (mouse tiruan)
+      end(false);
+    });
+    el.grid.addEventListener('touchcancel', () => end(true));
+    el.grid.addEventListener('mousedown', (e) => { if (e.button === 0) start(e.clientX, e.clientY, e.target); });
+    window.addEventListener('mousemove', (e) => move(e.clientX, e.clientY, e));
+    window.addEventListener('mouseup', () => end(false));
+    el.grid.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+
+  // ---------- Bagikan ----------
+  function showBusy(text) { el.busyText.textContent = text; el.busy.hidden = false; }
+  function hideBusy() { el.busy.hidden = true; }
+
+  async function buildPdf() {
+    const { jsPDF } = window.jspdf;
+    let doc = null;
+    for (let i = 0; i < state.pages.length; i++) {
+      el.busyText.textContent = `Membuat PDF… ${i + 1}/${state.pages.length}`;
+      await sleep(0);
+      const c = await renderPage(state.pages[i], 2000);
+      const land = c.width > c.height;
+      if (!doc) doc = new jsPDF({ unit: 'mm', format: 'a4', orientation: land ? 'landscape' : 'portrait', compress: true });
+      else doc.addPage('a4', land ? 'landscape' : 'portrait');
+      const pw = land ? 297 : 210, ph = land ? 210 : 297;
+      const r = Math.min(pw / c.width, ph / c.height);
+      const w = c.width * r, h = c.height * r;
+      doc.addImage(c.toDataURL('image/jpeg', 0.82), 'JPEG', (pw - w) / 2, (ph - h) / 2, w, h, undefined, 'FAST');
+      freeCanvas(c);
+    }
+    return doc.output('blob');
+  }
+
+  async function buildZip() {
+    const zip = new JSZip();
+    for (let i = 0; i < state.pages.length; i++) {
+      el.busyText.textContent = `Membuat ZIP… ${i + 1}/${state.pages.length}`;
+      await sleep(0);
+      const c = await renderPage(state.pages[i], MAX_SIDE);
+      const b = await toBlob(c, 0.9);
+      freeCanvas(c);
+      zip.file(String(i + 1).padStart(3, '0') + '.jpg', b);
+    }
+    return zip.generateAsync({ type: 'blob', compression: 'STORE' });
+  }
+
+  function download(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
+  function canShareFile(file) {
+    try { return !!(navigator.canShare && navigator.share && navigator.canShare({ files: [file] })); }
+    catch (e) { return false; }
+  }
+
+  let pending = null;   // file yang menunggu ketukan "Bagikan sekarang"
+  async function deliver(blob, filename, type) {
+    let file = null;
+    try { file = new File([blob], filename, { type }); } catch (e) { file = null; }
+    if (!file || !canShareFile(file)) { download(blob, filename); return; }
+    try {
+      await navigator.share({ files: [file], title: filename });
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;          // pengguna menutup menu bagikan
+      if (e && e.name === 'NotAllowedError') {           // butuh ketukan baru (umum di iPhone kalau file lama dibuat)
+        pending = { blob, file, filename };
+        el.readyText.textContent = filename + ' siap.';
+        el.ready.hidden = false;
+        return;
+      }
+      download(blob, filename);
+    }
+  }
+  async function sharePending() {
+    const p = pending;
+    pending = null;
+    el.ready.hidden = true;
+    if (!p) return;
+    try { await navigator.share({ files: [p.file], title: p.filename }); }
+    catch (e) { if (!e || e.name !== 'AbortError') download(p.blob, p.filename); }
+  }
+
+  let exporting = false;
+  async function exportAs(kind) {
+    if (exporting || !state.pages.length) return;
+    if (kind === 'pdf' ? !window.jspdf : !window.JSZip) {
+      alert('Komponen pembuat file belum termuat. Sambungkan internet sekali, lalu buka ulang app.');
+      return;
+    }
+    exporting = true;
+    showBusy(kind === 'pdf' ? 'Membuat PDF…' : 'Membuat ZIP…');
+    let blob = null;
+    try {
+      blob = kind === 'pdf' ? await buildPdf() : await buildZip();
+    } catch (e) {
+      alert('Gagal membuat file. Coba lagi dengan halaman lebih sedikit.');
+    }
+    hideBusy();
+    exporting = false;
+    if (blob) await deliver(blob, fileBase() + '.' + kind, kind === 'pdf' ? 'application/pdf' : 'application/zip');
+  }
+
+  async function newScan() {
+    if (state.pages.length && !confirm('Hapus semua halaman dan mulai scan baru?')) return;
+    state.pages.forEach((p) => { if (p.thumb) URL.revokeObjectURL(p.thumb); });
+    state.pages = [];
+    thumbGen++;
+    await store.clear();
+    saveMeta();
+    updateCount(false);
+    state.nameEdited = false;
+    T.locked = false; T.lockSig = null; T.lockQuad = null;
+    show('cam');
+  }
+
+  // ---------- Petunjuk pasang di iPhone ----------
+  function iosHint() {
+    const ios = /iphone|ipad|ipod/i.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const standalone = navigator.standalone === true ||
+      (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
+    if (ios && !standalone && lsGet('hint') !== '1') el.hint.hidden = false;
+  }
+
+  // ---------- Mulai ----------
+  function bind() {
+    document.addEventListener('pointerdown', initAudio, { passive: true });
+    document.addEventListener('touchend', initAudio, { passive: true });
+
+    el.shot.addEventListener('click', () => capture());
+    el.autoBtn.addEventListener('click', () => {
+      state.auto = !state.auto;
+      el.autoBtn.setAttribute('aria-checked', String(state.auto));
+      T.anchor = null;
+      setStatus();
+    });
+    el.doneBtn.addEventListener('click', () => show('res'));
+    el.backBtn.addEventListener('click', () => show('cam'));
+    el.pick.addEventListener('change', () => {
+      const files = [...el.pick.files];
+      el.pick.value = '';
+      importFiles(files);
+    });
+    el.hintClose.addEventListener('click', () => { el.hint.hidden = true; lsSet('hint', '1'); });
+
+    el.filters.addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (!b || b.dataset.f === state.filter) return;
+      state.filter = b.dataset.f;
+      [...el.filters.children].forEach((x) => x.setAttribute('aria-checked', String(x === b)));
+      saveMeta();
+      refreshThumbs();
+    });
+    el.name.addEventListener('input', () => { state.nameEdited = true; });
+    el.pdfBtn.addEventListener('click', () => exportAs('pdf'));
+    el.zipBtn.addEventListener('click', () => exportAs('zip'));
+    el.newBtn.addEventListener('click', newScan);
+
+    el.rotBtn.addEventListener('click', rotatePage);
+    el.delBtn.addEventListener('click', deletePage);
+    el.closeSheet.addEventListener('click', closeSheet);
+    el.sheet.addEventListener('click', (e) => { if (e.target === el.sheet) closeSheet(); });
+    el.readyBtn.addEventListener('click', sharePending);
+    el.readyClose.addEventListener('click', () => { pending = null; el.ready.hidden = true; });
+
+    bindGrid();
+
+    // Kamera dimatikan saat app di latar belakang, dinyalakan lagi saat kembali.
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) stopCam();
+      else if (state.screen === 'cam') startCam();
+    });
+  }
+
+  function init() {
+    bind();
+    show('cam');
+    restorePages();
+    waitCv();
+    iosHint();
+    tick();
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('sw.js').catch(() => { /* tetap jalan tanpa offline */ });
+    }
+  }
+
+  init();
+})();

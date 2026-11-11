@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <title>Lembar</title>
+  <meta name="description" content="Scanner dokumen otomatis untuk HP. Semua diproses di perangkat.">
+  <meta name="theme-color" content="#0b0f14">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Lembar">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- LAYAR 1: KAMERA -->
+  <main id="cam" class="screen">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="overlay"></canvas>
+    <div id="flash"></div>
+    <div id="status">Menyiapkan kamera…</div>
+
+    <div id="denied" class="card" hidden>
+      <p><b>Kamera tidak bisa dibuka.</b><br>Izinkan kamera di pengaturan browser, atau pilih foto dari galeri.</p>
+      <label class="btn primary">
+        Pilih foto dari galeri
+        <input id="pick" type="file" accept="image/*" multiple hidden>
+      </label>
+    </div>
+
+    <div id="hint" class="card" hidden>
+      <p>Pasang ke layar utama: ketuk <b>Share</b> lalu <b>“Add to Home Screen”</b>.</p>
+      <button id="hintClose" aria-label="Tutup petunjuk">✕</button>
+    </div>
+
+    <div class="bar">
+      <button id="autoBtn" class="side" role="switch" aria-checked="true">
+        <span class="track"><span class="knob"></span></span>
+        <span class="lbl">Otomatis</span>
+      </button>
+      <button id="shot" aria-label="Potret"></button>
+      <button id="doneBtn" class="side done">
+        <span>Selesai</span>
+        <span id="count">0</span>
+      </button>
+    </div>
+  </main>
+
+  <!-- LAYAR 2: HASIL -->
+  <main id="res" class="screen" hidden>
+    <header>
+      <button id="backBtn" aria-label="Kembali ke kamera">‹ Kamera</button>
+      <h1 id="title">Hasil</h1>
+    </header>
+
+    <div id="grid"></div>
+    <p id="empty" hidden>Belum ada halaman.</p>
+
+    <div class="panel">
+      <div class="seg" id="filters" role="radiogroup" aria-label="Filter">
+        <button data-f="asli" role="radio">Asli</button>
+        <button data-f="bw" role="radio">Hitam-putih</button>
+        <button data-f="tajam" role="radio">Tajam</button>
+      </div>
+      <input id="name" type="text" inputmode="text" autocomplete="off" autocapitalize="off"
+             spellcheck="false" aria-label="Nama file" placeholder="Nama file">
+      <button id="pdfBtn" class="btn primary big">Bagikan PDF</button>
+      <div class="row">
+        <button id="zipBtn" class="btn">Bagikan ZIP</button>
+        <button id="newBtn" class="btn ghost">Scan baru</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- Lembar aksi halaman (putar / hapus) -->
+  <div id="sheet" class="backdrop" hidden>
+    <div class="sheet">
+      <img id="sheetImg" alt="">
+      <div class="row">
+        <button id="rotBtn" class="btn">Putar</button>
+        <button id="delBtn" class="btn danger">Hapus</button>
+      </div>
+      <button id="closeSheet" class="btn ghost">Tutup</button>
+    </div>
+  </div>
+
+  <!-- File siap dibagikan (dipakai kalau HP butuh ketukan baru untuk membuka menu bagikan) -->
+  <div id="ready" class="backdrop" hidden>
+    <div class="sheet">
+      <p id="readyText">File siap.</p>
+      <button id="readyBtn" class="btn primary big">Bagikan sekarang</button>
+      <button id="readyClose" class="btn ghost">Batal</button>
+    </div>
+  </div>
+
+  <div id="busy" class="backdrop center" hidden>
+    <div class="spinner"></div>
+    <p id="busyText">Memproses…</p>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js" crossorigin="anonymous" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" crossorigin="anonymous" defer></script>
+  <script src="app.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js"
+          crossorigin="anonymous" async onerror="window.__cvFail=true"></script>
+</body>
+</html>
