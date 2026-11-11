@@ -186,7 +186,7 @@
       }
       if (ap.rows !== 4) return null;
       const qa = cv.contourArea(ap, false);
-      if (qa < w * h * 0.1 || qa > w * h * 0.97) return null;
+      if (qa < w * h * 0.05 || qa > w * h * 0.97) return null;
       const fit = area / qa;                     // seberapa penuh kontur mengisi segi empatnya
       if (fit < 0.75) return null;
       const d = ap.data32S;
@@ -199,7 +199,13 @@
         const cos = ((a.x - p.x) * (b.x - p.x) + (a.y - p.y) * (b.y - p.y)) / (la * lb);
         if (Math.abs(cos) > 0.77) return null;   // sudut di luar 40°–140°: bukan kertas
       }
-      return { pts, score: qa * fit * fit };
+      // Sudut yang menempel di tepi frame biasanya milik latar (meja, lantai) yang terpotong
+      // layar, bukan milik kertas. Tiga sudut atau lebih di tepi: tolak.
+      const mx = w * 0.02, my = h * 0.02;
+      const onEdge = pts.filter((p) => p.x < mx || p.y < my || p.x > w - 1 - mx || p.y > h - 1 - my).length;
+      if (onEdge >= 3) return null;
+      const penalty = onEdge === 2 ? 0.4 : onEdge === 1 ? 0.8 : 1;
+      return { pts, score: qa * fit * fit * penalty };
     } finally { hull.delete(); ap.delete(); }
   }
 
@@ -209,7 +215,7 @@
     let best = null;
     try {
       cv.findContours(bin, contours, hier, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
-      const minArea = w * h * 0.08;
+      const minArea = w * h * 0.04;
       for (let i = 0; i < contours.size(); i++) {
         const c = contours.get(i);
         const area = cv.contourArea(c, false);
@@ -231,8 +237,8 @@
     const clean = new cv.Mat();
     const bin = new cv.Mat();
     const edges = cv.Mat.zeros(h, w, cv.CV_8U);
-    const rgb = new cv.Mat(), hsv = new cv.Mat();
-    const chans = new cv.MatVector(), hs = new cv.MatVector();
+    const rgb = new cv.Mat(), hsv = new cv.Mat(), lab = new cv.Mat();
+    const chans = new cv.MatVector(), hs = new cv.MatVector(), ls = new cv.MatVector();
     const anchor = new cv.Point(-1, -1);
     const ksize = new cv.Size(5, 5);
     const border = cv.morphologyDefaultBorderValue();
@@ -269,26 +275,45 @@
       // Cara 2: kertas sebagai bidang. (a) lebih terang dari latar, (b) lebih berwarna
       // dari latar (kertas warna di meja netral), (c) kurang berwarna (kertas putih di meja warna).
       let b = null;
-      const consider = (q) => { if (q && (!b || q.score > b.score)) b = q; };
+      const dbg = window.__lembarDbg;
+      if (dbg) dbg.push({ name: 'tepi', q: a });
+      const consider = (name) => {
+        const q = bestQuad(bin, w, h);
+        if (dbg) dbg.push({ name, q });
+        if (q && (!b || q.score > b.score)) b = q;
+      };
+      // Pisahkan satu kanal jadi dua kelompok (Otsu), dua arah: kertas lebih tinggi atau lebih rendah dari latar.
+      const both = (m, name) => {
+        cv.GaussianBlur(m, m, ksize, 0, 0, cv.BORDER_DEFAULT);
+        cv.threshold(m, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+        consider(name + '+');
+        cv.threshold(m, bin, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+        consider(name + '-');
+      };
       cv.morphologyEx(gray, clean, cv.MORPH_CLOSE, closeKernel, anchor, 1, cv.BORDER_REPLICATE, border);
       cv.threshold(clean, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-      consider(bestQuad(bin, w, h));
+      consider('terang');
       cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB, 0);
       cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV, 0);
       cv.split(hsv, hs);
       const sat = hs.get(1);
-      cv.GaussianBlur(sat, sat, ksize, 0, 0, cv.BORDER_DEFAULT);
-      cv.threshold(sat, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-      consider(bestQuad(bin, w, h));
-      cv.threshold(sat, bin, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
-      consider(bestQuad(bin, w, h));
+      both(sat, 'jenuh');
       sat.delete();
+      // Rona warna (Lab): kanal a = hijau↔merah, kanal b = biru↔kuning. Memisahkan mis. kartu
+      // kebiruan dari meja krem walau sama terangnya.
+      cv.cvtColor(rgb, lab, cv.COLOR_RGB2Lab, 0);
+      cv.split(lab, ls);
+      for (const i of [1, 2]) {
+        const m = ls.get(i);
+        both(m, i === 1 ? 'a' : 'b');
+        m.delete();
+      }
 
       const best = a && b ? (b.score >= a.score * 0.9 ? b : a) : (a || b);
       quad = best ? best.pts : null;
     } finally {
       src.delete(); gray.delete(); clean.delete(); bin.delete(); edges.delete();
-      rgb.delete(); hsv.delete(); chans.delete(); hs.delete();
+      rgb.delete(); hsv.delete(); lab.delete(); chans.delete(); hs.delete(); ls.delete();
     }
     return { quad, sig };
   }
@@ -1159,6 +1184,12 @@
       navigator.serviceWorker.register('sw.js').catch(() => { /* tetap jalan tanpa offline */ });
     }
   }
+
+  // Untuk pengujian deteksi dari konsol: kembalikan 4 sudut (skala 0..1) pada sebuah canvas.
+  window.__lembarDetect = (canvas) => {
+    const f = findQuad(canvas);
+    return f.smallQuad ? f.smallQuad.map((p) => ({ x: p.x / f.k / canvas.width, y: p.y / f.k / canvas.height })) : null;
+  };
 
   init();
 })();
