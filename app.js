@@ -98,7 +98,10 @@
     state.pages.push(p);
     updateCount(true);
     saveMeta();
-    try { await store.put({ id: p.id, buf: await blob.arrayBuffer(), type: blob.type }); } catch (e) { /* tetap di memori */ }
+    // Simpan di latar belakang: jangan sampai penyimpanan yang macet menahan jepretan berikutnya.
+    blob.arrayBuffer()
+      .then((buf) => store.put({ id: p.id, buf, type: blob.type }))
+      .catch(() => { /* tetap di memori */ });
   }
 
   function updateCount(bump) {
@@ -127,7 +130,7 @@
 
   // ---------- OpenCV: deteksi tepi & perspektif ----------
   let cvOk = false;
-  let kernel = null;
+  let kernel = null, closeKernel = null;
 
   function waitCv() {
     const check = () => {
@@ -147,6 +150,7 @@
   function cvLoaded() {
     try {
       kernel = cv.Mat.ones(3, 3, cv.CV_8U);
+      closeKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(9, 9));
       cvOk = true;
     } catch (e) { window.__cvFail = true; }
     setStatus();
@@ -162,30 +166,54 @@
     return [0, 1, 2, 3].map((i) => s[(first + i) % 4]);
   }
 
+  // Ubah satu kontur jadi segi empat (lewat convex hull supaya tahan tepi bergerigi,
+  // sudut tumpul, atau jari yang menutupi sedikit). Mengembalikan { pts, score } atau null.
+  function quadFrom(c, area, w, h) {
+    const hull = new cv.Mat(), ap = new cv.Mat();
+    try {
+      cv.convexHull(c, hull, false, true);
+      const peri = cv.arcLength(hull, true);
+      for (const eps of [0.02, 0.035, 0.05, 0.08]) {
+        cv.approxPolyDP(hull, ap, eps * peri, true);
+        if (ap.rows <= 4) break;
+      }
+      if (ap.rows !== 4) return null;
+      const qa = cv.contourArea(ap, false);
+      if (qa < w * h * 0.1 || qa > w * h * 0.97) return null;
+      const fit = area / qa;                     // seberapa penuh kontur mengisi segi empatnya
+      if (fit < 0.75) return null;
+      const d = ap.data32S;
+      const pts = orderQuad([0, 1, 2, 3].map((j) => ({ x: d[j * 2], y: d[j * 2 + 1] })));
+      const minSide = Math.min(w, h) * 0.15;
+      for (let i = 0; i < 4; i++) {
+        const p = pts[i], a = pts[(i + 3) % 4], b = pts[(i + 1) % 4];
+        const la = dist(p, a), lb = dist(p, b);
+        if (la < minSide || lb < minSide) return null;
+        const cos = ((a.x - p.x) * (b.x - p.x) + (a.y - p.y) * (b.y - p.y)) / (la * lb);
+        if (Math.abs(cos) > 0.77) return null;   // sudut di luar 40°–140°: bukan kertas
+      }
+      return { pts, score: qa * fit * fit };
+    } finally { hull.delete(); ap.delete(); }
+  }
+
   function bestQuad(bin, w, h) {
     const contours = new cv.MatVector();
     const hier = new cv.Mat();
-    let best = null, bestArea = 0;
+    let best = null;
     try {
       cv.findContours(bin, contours, hier, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
-      const minArea = w * h * 0.12, maxArea = w * h * 0.97;
+      const minArea = w * h * 0.08;
       for (let i = 0; i < contours.size(); i++) {
         const c = contours.get(i);
         const area = cv.contourArea(c, false);
-        if (area > minArea && area < maxArea && area > bestArea) {
-          const ap = new cv.Mat();
-          cv.approxPolyDP(c, ap, 0.02 * cv.arcLength(c, true), true);
-          if (ap.rows === 4 && cv.isContourConvex(ap)) {
-            const d = ap.data32S;
-            best = [0, 1, 2, 3].map((j) => ({ x: d[j * 2], y: d[j * 2 + 1] }));
-            bestArea = area;
-          }
-          ap.delete();
+        if (area > minArea) {
+          const q = quadFrom(c, area, w, h);
+          if (q && (!best || q.score > best.score)) best = q;
         }
         c.delete();
       }
     } finally { contours.delete(); hier.delete(); }
-    return best ? orderQuad(best) : null;
+    return best;
   }
 
   // Cari kertas di frame kecil. Mengembalikan { quad | null, sig } (sig = salinan abu-abu untuk membandingkan frame).
@@ -193,21 +221,38 @@
     const w = img.width, h = img.height;
     const src = cv.matFromImageData(img);
     const gray = new cv.Mat();
+    const clean = new cv.Mat();
     const bin = new cv.Mat();
+    const anchor = new cv.Point(-1, -1);
     let quad = null, sig = null;
     try {
       cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
       cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
       sig = new Uint8Array(gray.data);
-      cv.Canny(gray, bin, 60, 160, 3, false);
-      cv.dilate(bin, bin, kernel, new cv.Point(-1, -1), 1, cv.BORDER_CONSTANT, cv.morphologyDefaultBorderValue());
-      quad = bestQuad(bin, w, h);
-      if (!quad) {
-        // Cadangan: kertas terang di atas latar gelap.
-        cv.threshold(gray, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-        quad = bestQuad(bin, w, h);
+      // Hapus tulisan dari kertas (morphological close) supaya yang tersisa hanya tepi kertas.
+      cv.morphologyEx(gray, clean, cv.MORPH_CLOSE, closeKernel, anchor, 1, cv.BORDER_REPLICATE, cv.morphologyDefaultBorderValue());
+
+      // Cara 1: tepi (Canny), celah kecil ditutup.
+      cv.Canny(clean, bin, 30, 90, 3, false);
+      cv.dilate(bin, bin, kernel, anchor, 2, cv.BORDER_CONSTANT, cv.morphologyDefaultBorderValue());
+      const a = bestQuad(bin, w, h);
+      if (a) {
+        // Kontur tepi yang ditebalkan sedikit di luar kertas: geser masuk sekitar 2 px.
+        const cx = (a.pts[0].x + a.pts[1].x + a.pts[2].x + a.pts[3].x) / 4;
+        const cy = (a.pts[0].y + a.pts[1].y + a.pts[2].y + a.pts[3].y) / 4;
+        a.pts = a.pts.map((p) => {
+          const l = Math.hypot(p.x - cx, p.y - cy) || 1;
+          return { x: p.x - (p.x - cx) / l * 2.5, y: p.y - (p.y - cy) / l * 2.5 };
+        });
       }
-    } finally { src.delete(); gray.delete(); bin.delete(); }
+
+      // Cara 2: kertas lebih terang dari latar (Otsu).
+      cv.threshold(clean, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+      const b = bestQuad(bin, w, h);
+
+      const best = a && b ? (b.score >= a.score * 0.9 ? b : a) : (a || b);
+      quad = best ? best.pts : null;
+    } finally { src.delete(); gray.delete(); clean.delete(); bin.delete(); }
     return { quad, sig };
   }
 
@@ -334,7 +379,7 @@
 
   function track(d, sw, sh) {
     const now = performance.now();
-    const tol = Math.max(sw, sh) * 0.03;
+    const tol = Math.max(sw, sh) * 0.04;
     const q = d.quad;
 
     if (q) {
@@ -887,6 +932,8 @@
     document.addEventListener('touchend', initAudio, { passive: true });
 
     el.shot.addEventListener('click', () => capture());
+    // Ketuk di mana saja pada gambar kamera = potret (pengganti tombol volume, yang tidak bisa dibaca web).
+    el.cam.addEventListener('click', (e) => { if (e.target === el.video || e.target === el.cam) capture(); });
     el.autoBtn.addEventListener('click', () => {
       state.auto = !state.auto;
       el.autoBtn.setAttribute('aria-checked', String(state.auto));
