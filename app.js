@@ -230,19 +230,32 @@
     const gray = new cv.Mat();
     const clean = new cv.Mat();
     const bin = new cv.Mat();
+    const edges = cv.Mat.zeros(h, w, cv.CV_8U);
+    const rgb = new cv.Mat(), hsv = new cv.Mat();
+    const chans = new cv.MatVector(), hs = new cv.MatVector();
     const anchor = new cv.Point(-1, -1);
+    const ksize = new cv.Size(5, 5);
+    const border = cv.morphologyDefaultBorderValue();
     let quad = null, sig = null;
     try {
       cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-      cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+      cv.GaussianBlur(gray, gray, ksize, 0, 0, cv.BORDER_DEFAULT);
       sig = new Uint8Array(gray.data);
-      // Hapus tulisan dari kertas (morphological close) supaya yang tersisa hanya tepi kertas.
-      cv.morphologyEx(gray, clean, cv.MORPH_CLOSE, closeKernel, anchor, 1, cv.BORDER_REPLICATE, cv.morphologyDefaultBorderValue());
 
-      // Cara 1: tepi (Canny), celah kecil ditutup.
-      cv.Canny(clean, bin, 30, 90, 3, false);
-      cv.dilate(bin, bin, kernel, anchor, 2, cv.BORDER_CONSTANT, cv.morphologyDefaultBorderValue());
-      const a = bestQuad(bin, w, h);
+      // Cara 1: tepi (Canny) di tiap kanal warna, digabung. Kertas kuning di meja putih
+      // nyaris tak terlihat di abu-abu, tapi jelas di kanal biru.
+      cv.split(src, chans);
+      for (let i = 0; i < 3; i++) {
+        const m = chans.get(i);
+        cv.GaussianBlur(m, m, ksize, 0, 0, cv.BORDER_DEFAULT);
+        // Hapus tulisan (morphological close) supaya yang tersisa hanya tepi kertas.
+        cv.morphologyEx(m, clean, cv.MORPH_CLOSE, closeKernel, anchor, 1, cv.BORDER_REPLICATE, border);
+        cv.Canny(clean, bin, 30, 90, 3, false);
+        cv.bitwise_or(edges, bin, edges);
+        m.delete();
+      }
+      cv.dilate(edges, edges, kernel, anchor, 2, cv.BORDER_CONSTANT, border);
+      const a = bestQuad(edges, w, h);
       if (a) {
         // Kontur tepi yang ditebalkan sedikit di luar kertas: geser masuk sekitar 2 px.
         const cx = (a.pts[0].x + a.pts[1].x + a.pts[2].x + a.pts[3].x) / 4;
@@ -253,13 +266,30 @@
         });
       }
 
-      // Cara 2: kertas lebih terang dari latar (Otsu).
+      // Cara 2: kertas sebagai bidang. (a) lebih terang dari latar, (b) lebih berwarna
+      // dari latar (kertas warna di meja netral), (c) kurang berwarna (kertas putih di meja warna).
+      let b = null;
+      const consider = (q) => { if (q && (!b || q.score > b.score)) b = q; };
+      cv.morphologyEx(gray, clean, cv.MORPH_CLOSE, closeKernel, anchor, 1, cv.BORDER_REPLICATE, border);
       cv.threshold(clean, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-      const b = bestQuad(bin, w, h);
+      consider(bestQuad(bin, w, h));
+      cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB, 0);
+      cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV, 0);
+      cv.split(hsv, hs);
+      const sat = hs.get(1);
+      cv.GaussianBlur(sat, sat, ksize, 0, 0, cv.BORDER_DEFAULT);
+      cv.threshold(sat, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+      consider(bestQuad(bin, w, h));
+      cv.threshold(sat, bin, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+      consider(bestQuad(bin, w, h));
+      sat.delete();
 
       const best = a && b ? (b.score >= a.score * 0.9 ? b : a) : (a || b);
       quad = best ? best.pts : null;
-    } finally { src.delete(); gray.delete(); clean.delete(); bin.delete(); }
+    } finally {
+      src.delete(); gray.delete(); clean.delete(); bin.delete(); edges.delete();
+      rgb.delete(); hsv.delete(); chans.delete(); hs.delete();
+    }
     return { quad, sig };
   }
 
