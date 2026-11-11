@@ -18,7 +18,8 @@
     filters: $('filters'), name: $('name'), pdfBtn: $('pdfBtn'), zipBtn: $('zipBtn'), newBtn: $('newBtn'),
     sheet: $('sheet'), sheetImg: $('sheetImg'), rotBtn: $('rotBtn'), delBtn: $('delBtn'), closeSheet: $('closeSheet'),
     ready: $('ready'), readyText: $('readyText'), readyBtn: $('readyBtn'), readyClose: $('readyClose'),
-    busy: $('busy'), busyText: $('busyText')
+    busy: $('busy'), busyText: $('busyText'),
+    cropBtn: $('cropBtn'), crop: $('crop'), cropCanvas: $('cropCanvas'), cropCancel: $('cropCancel'), cropSave: $('cropSave')
   };
 
   const state = { pages: [], filter: 'asli', screen: 'cam', auto: true, nameEdited: false };
@@ -84,6 +85,8 @@
       try {
         old.push({
           id: r.id, blob: new Blob([r.buf], { type: r.type || 'image/jpeg' }),
+          orig: r.orig ? new Blob([r.orig], { type: 'image/jpeg' }) : null,
+          quad: r.quad || null,
           rot: (meta.rot && meta.rot[r.id]) || 0, thumb: null, key: ''
         });
       } catch (e) { /* lewati rekaman rusak */ }
@@ -93,14 +96,18 @@
   }
 
   let seq = 0;
-  async function addPage(blob) {
-    const p = { id: Date.now() + '-' + (seq++), blob, rot: 0, thumb: null, key: '' };
+  // blob = hasil potong; orig = foto utuh (untuk atur ulang potongan); quad = 4 sudut, skala 0..1 terhadap orig.
+  async function addPage(blob, orig, quad) {
+    const p = { id: Date.now() + '-' + (seq++), blob, orig: orig || null, quad: quad || null, rot: 0, thumb: null, key: '' };
     state.pages.push(p);
     updateCount(true);
     saveMeta();
-    // Simpan di latar belakang: jangan sampai penyimpanan yang macet menahan jepretan berikutnya.
-    blob.arrayBuffer()
-      .then((buf) => store.put({ id: p.id, buf, type: blob.type }))
+    persist(p);
+  }
+  // Simpan di latar belakang: jangan sampai penyimpanan yang macet menahan jepretan berikutnya.
+  function persist(p) {
+    Promise.all([p.blob.arrayBuffer(), p.orig ? p.orig.arrayBuffer() : null])
+      .then(([buf, orig]) => store.put({ id: p.id, buf, type: p.blob.type, orig, quad: p.quad }))
       .catch(() => { /* tetap di memori */ });
   }
 
@@ -508,8 +515,10 @@
       let out = full;
       if (quad) { try { out = warp(full, quad); } catch (e) { out = full; } }  // gagal -> simpan foto utuh
       const blob = await toBlob(out, 0.9);
-      if (out !== full) freeCanvas(out);
-      if (blob) await addPage(blob);
+      const cropped = out !== full;
+      if (cropped) freeCanvas(out);
+      const orig = await toBlob(full, 0.85);
+      if (blob) await addPage(blob, orig, cropped ? quad.map((p) => ({ x: p.x / vw, y: p.y / vh })) : null);
 
       T.locked = true;
       T.lockSig = sig;
@@ -536,17 +545,23 @@
         c.width = Math.round(im.naturalWidth * s);
         c.height = Math.round(im.naturalHeight * s);
         c.getContext('2d', { willReadFrequently: true }).drawImage(im, 0, 0, c.width, c.height);
-        let out = c;
+        let out = c, quad = null;
         if (cvOk) {
           try {
             const f = findQuad(c);
-            if (f.smallQuad) out = warp(c, f.smallQuad.map((p) => ({ x: p.x / f.k, y: p.y / f.k })));
+            if (f.smallQuad) {
+              quad = f.smallQuad.map((p) => ({ x: p.x / f.k, y: p.y / f.k }));
+              out = warp(c, quad);
+            }
           } catch (e) { out = c; }
         }
         const blob = await toBlob(out, 0.9);
-        if (out !== c) freeCanvas(out);
+        const cropped = out !== c;
+        if (cropped) freeCanvas(out);
+        const orig = await toBlob(c, 0.85);
+        const norm = cropped ? quad.map((p) => ({ x: p.x / c.width, y: p.y / c.height })) : null;
         freeCanvas(c);
-        if (blob) { await addPage(blob); ok++; }
+        if (blob) { await addPage(blob, orig, norm); ok++; }
       } catch (e) { /* lewati file yang gagal */ }
       await sleep(0);
     }
@@ -724,6 +739,127 @@
     updateCount(false);
     closeSheet();
     renderGrid();
+  }
+
+  // ---------- Atur sudut potong manual ----------
+  const C = { page: null, img: null, pts: null, drag: -1, box: null };
+  const kctx = el.cropCanvas.getContext('2d');
+
+  async function openCrop() {
+    const p = sheetPage;
+    if (!p) return;
+    closeSheet();
+    try { C.img = await loadImage(p.orig || p.blob); } catch (e) { return; }
+    C.page = p;
+    C.pts = (p.orig && p.quad)
+      ? p.quad.map((q) => ({ x: q.x, y: q.y }))
+      : [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }];
+    C.drag = -1;
+    el.crop.hidden = false;
+    drawCrop();
+  }
+  function closeCrop() { C.page = null; C.img = null; el.crop.hidden = true; }
+
+  function drawCrop() {
+    if (!C.img) return;
+    const cn = el.cropCanvas;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const cw = cn.clientWidth, ch = cn.clientHeight;
+    if (cn.width !== Math.round(cw * dpr) || cn.height !== Math.round(ch * dpr)) {
+      cn.width = Math.round(cw * dpr); cn.height = Math.round(ch * dpr);
+    }
+    kctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    kctx.clearRect(0, 0, cw, ch);
+    const pad = 28, iw = C.img.naturalWidth, ih = C.img.naturalHeight;
+    const s = Math.min((cw - 2 * pad) / iw, (ch - 2 * pad) / ih);
+    const w = iw * s, h = ih * s, x = (cw - w) / 2, y = (ch - h) / 2;
+    C.box = { x, y, w, h };
+    kctx.drawImage(C.img, x, y, w, h);
+    const P = C.pts.map((p) => ({ x: x + p.x * w, y: y + p.y * h }));
+    const poly = () => { P.forEach((p, i) => (i ? kctx.lineTo(p.x, p.y) : kctx.moveTo(p.x, p.y))); kctx.closePath(); };
+    kctx.beginPath(); kctx.rect(x, y, w, h); poly();
+    kctx.fillStyle = 'rgba(0,0,0,.55)';
+    kctx.fill('evenodd');                       // gelapkan bagian yang akan dibuang
+    kctx.beginPath(); poly();
+    kctx.lineWidth = 2; kctx.strokeStyle = '#2dd4a7'; kctx.stroke();
+    P.forEach((p, i) => {
+      kctx.beginPath(); kctx.arc(p.x, p.y, i === C.drag ? 18 : 13, 0, Math.PI * 2);
+      kctx.fillStyle = 'rgba(45,212,167,.35)'; kctx.fill();
+      kctx.lineWidth = 3; kctx.strokeStyle = '#fff'; kctx.stroke();
+    });
+  }
+
+  function bindCrop() {
+    const cn = el.cropCanvas;
+    const pos = (e) => { const r = cn.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+    cn.addEventListener('pointerdown', (e) => {
+      if (!C.box) return;
+      const m = pos(e);
+      let best = -1, bd = 48;
+      C.pts.forEach((p, i) => {
+        const d = Math.hypot(C.box.x + p.x * C.box.w - m.x, C.box.y + p.y * C.box.h - m.y);
+        if (d < bd) { bd = d; best = i; }
+      });
+      C.drag = best;
+      if (best >= 0) { try { cn.setPointerCapture(e.pointerId); } catch (err) { /* abaikan */ } drawCrop(); }
+    });
+    cn.addEventListener('pointermove', (e) => {
+      if (C.drag < 0) return;
+      const m = pos(e);
+      C.pts[C.drag] = {
+        x: Math.min(1, Math.max(0, (m.x - C.box.x) / C.box.w)),
+        y: Math.min(1, Math.max(0, (m.y - C.box.y) / C.box.h))
+      };
+      drawCrop();
+    });
+    const up = () => { if (C.drag >= 0) { C.drag = -1; drawCrop(); } };
+    cn.addEventListener('pointerup', up);
+    cn.addEventListener('pointercancel', up);
+    window.addEventListener('resize', () => { if (!el.crop.hidden) drawCrop(); });
+  }
+
+  async function saveCrop() {
+    const p = C.page, im = C.img;
+    if (!p || !im) return;
+    showBusy('Memotong…');
+    await sleep(30);
+    try {
+      const s = Math.min(1, 3000 / Math.max(im.naturalWidth, im.naturalHeight));
+      const c = document.createElement('canvas');
+      c.width = Math.round(im.naturalWidth * s);
+      c.height = Math.round(im.naturalHeight * s);
+      const cx = c.getContext('2d', { willReadFrequently: true });
+      cx.drawImage(im, 0, 0, c.width, c.height);
+      const norm = orderQuad(C.pts);
+      const q = norm.map((t) => ({ x: t.x * c.width, y: t.y * c.height }));
+      let out;
+      if (cvOk) {
+        out = warp(c, q);
+      } else {
+        // Tanpa OpenCV: potong kotak lurus yang melingkupi 4 titik.
+        const x0 = Math.min(...q.map((t) => t.x)), x1 = Math.max(...q.map((t) => t.x));
+        const y0 = Math.min(...q.map((t) => t.y)), y1 = Math.max(...q.map((t) => t.y));
+        if (x1 - x0 < 60 || y1 - y0 < 60) throw new Error('terlalu kecil');
+        out = document.createElement('canvas');
+        out.width = Math.round(x1 - x0); out.height = Math.round(y1 - y0);
+        out.getContext('2d').drawImage(c, x0, y0, out.width, out.height, 0, 0, out.width, out.height);
+      }
+      const blob = await toBlob(out, 0.9);
+      freeCanvas(out); freeCanvas(c);
+      if (!blob) throw new Error('gagal menyimpan');
+      if (!p.orig) p.orig = p.blob;             // halaman lama: hasil potong lama jadi sumbernya
+      p.blob = blob;
+      p.quad = norm;
+      p.key = '';
+      persist(p);
+    } catch (e) {
+      alert('Gagal memotong. Pastikan 4 titik membentuk kotak yang cukup besar.');
+      hideBusy();
+      return;
+    }
+    hideBusy();
+    closeCrop();
+    refreshThumbs();
   }
 
   // Ketuk = buka aksi; tahan lalu seret = ubah urutan.
@@ -963,6 +1099,10 @@
     el.newBtn.addEventListener('click', newScan);
 
     el.rotBtn.addEventListener('click', rotatePage);
+    el.cropBtn.addEventListener('click', openCrop);
+    el.cropCancel.addEventListener('click', closeCrop);
+    el.cropSave.addEventListener('click', saveCrop);
+    bindCrop();
     el.delBtn.addEventListener('click', deletePage);
     el.closeSheet.addEventListener('click', closeSheet);
     el.sheet.addEventListener('click', (e) => { if (e.target === el.sheet) closeSheet(); });

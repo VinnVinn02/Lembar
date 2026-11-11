@@ -80,11 +80,22 @@
   <div id="sheet" class="backdrop" hidden>
     <div class="sheet">
       <img id="sheetImg" alt="">
-      <div class="row">
+      <div class="row three">
         <button id="rotBtn" class="btn">Putar</button>
+        <button id="cropBtn" class="btn">Potong</button>
         <button id="delBtn" class="btn danger">Hapus</button>
       </div>
       <button id="closeSheet" class="btn ghost">Tutup</button>
+    </div>
+  </div>
+
+  <!-- Atur sudut potong manual -->
+  <div id="crop" class="screen" hidden>
+    <p class="cropTip">Geser 4 titik ke sudut kertas</p>
+    <div class="cropStage"><canvas id="cropCanvas"></canvas></div>
+    <div class="row cropBar">
+      <button id="cropCancel" class="btn ghost">Batal</button>
+      <button id="cropSave" class="btn primary">Simpan</button>
     </div>
   </div>
 
