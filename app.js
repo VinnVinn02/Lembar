@@ -22,7 +22,7 @@
     cropBtn: $('cropBtn'), crop: $('crop'), cropCanvas: $('cropCanvas'), cropCancel: $('cropCancel'), cropSave: $('cropSave')
   };
 
-  const state = { pages: [], filter: 'asli', screen: 'cam', auto: true, nameEdited: false };
+  const state = { pages: [], filter: 'tajam', screen: 'cam', auto: true, nameEdited: false };
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
@@ -656,15 +656,76 @@
       px[j] = px[j + 1] = px[j + 2] = v;
     }
   }
-  // Tajam: ratakan pencahayaan, naikkan kontras, pertajam tepi huruf.
-  function filterSharp(d) {
+  // Perkiraan warna kertas kosong di tiap titik (per kanal): gambar diperkecil, tulisan dan
+  // gambar kecil dihapus dengan filter maksimum berjendela besar, dihaluskan, lalu diperbesar lagi.
+  function paperMap(canvas) {
+    const w = canvas.width, h = canvas.height;
+    const k = Math.min(1, 200 / Math.max(w, h));
+    const sw = Math.max(8, Math.round(w * k)), sh = Math.max(8, Math.round(h * k));
+    const s = document.createElement('canvas');
+    s.width = sw; s.height = sh;
+    const sx = s.getContext('2d', { willReadFrequently: true });
+    sx.drawImage(canvas, 0, 0, sw, sh);
+    const d = sx.getImageData(0, 0, sw, sh), px = d.data;
+    const n = sw * sh, a = new Float32Array(n), t = new Float32Array(n);
+    const rMax = Math.max(2, Math.round(Math.max(sw, sh) * 0.14));
+    const rBlur = Math.max(2, Math.round(Math.max(sw, sh) * 0.05));
+    const pass = (src, dst, r, isMax, horizontal) => {
+      const len = horizontal ? sw : sh, lines = horizontal ? sh : sw, step = horizontal ? 1 : sw;
+      for (let l = 0; l < lines; l++) {
+        const base = horizontal ? l * sw : l;
+        for (let i = 0; i < len; i++) {
+          const i0 = Math.max(0, i - r), i1 = Math.min(len - 1, i + r);
+          let v = 0;
+          if (isMax) { for (let j = i0; j <= i1; j++) { const q = src[base + j * step]; if (q > v) v = q; } }
+          else { for (let j = i0; j <= i1; j++) v += src[base + j * step]; v /= (i1 - i0 + 1); }
+          dst[base + i * step] = v;
+        }
+      }
+    };
+    for (let c = 0; c < 3; c++) {
+      const hist = new Uint32Array(256);
+      for (let i = 0; i < n; i++) { a[i] = px[i * 4 + c]; hist[px[i * 4 + c]]++; }
+      // Batas atas = terang kertas pada umumnya (persentil 85). Mencegah sisa latar yang lebih
+      // terang di pinggir (mis. meja putih di sudut) dianggap sebagai warna kertas.
+      let cap = 255, acc = 0;
+      for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= n * 0.85) { cap = Math.min(255, v * 1.04); break; } }
+      pass(a, t, rMax, true, true); pass(t, a, rMax, true, false);
+      for (let i = 0; i < n; i++) if (a[i] > cap) a[i] = cap;
+      pass(a, t, rBlur, false, true); pass(t, a, rBlur, false, false);
+      for (let i = 0; i < n; i++) px[i * 4 + c] = a[i];
+    }
+    sx.putImageData(d, 0, 0);
+    const f = document.createElement('canvas');
+    f.width = w; f.height = h;
+    const fx = f.getContext('2d', { willReadFrequently: true });
+    fx.imageSmoothingEnabled = true;
+    fx.imageSmoothingQuality = 'high';
+    fx.drawImage(s, 0, 0, w, h);
+    const out = fx.getImageData(0, 0, w, h).data;
+    freeCanvas(s); freeCanvas(f);
+    return out;
+  }
+
+  // Tajam: kertas jadi putih bersih (bayangan & warna kertas hilang), warna dipertegas,
+  // tulisan dipergelap dan dipertajam.
+  function filterSharp(d, canvas) {
     const w = d.width, h = d.height, px = d.data;
-    const g = toGray(d), m = meanMap(g, w, h, Math.max(12, (Math.max(w, h) / 14) | 0));
-    for (let i = 0, j = 0; i < g.length; i++, j += 4) {
-      const gain = Math.max(1, Math.min(2.5, 242 / Math.max(m[i], 48)));
-      px[j] = (px[j] * gain - 128) * 1.12 + 128;
-      px[j + 1] = (px[j + 1] * gain - 128) * 1.12 + 128;
-      px[j + 2] = (px[j + 2] * gain - 128) * 1.12 + 128;
+    const bg = paperMap(canvas);
+    const LO = 28, SPAN = 255 / (236 - LO), SAT = 1.45;
+    for (let j = 0; j < px.length; j += 4) {
+      // 1) bagi dengan warna kertas -> kertas = putih; 2) regangkan kontras
+      let r = (px[j] * 250 / Math.max(bg[j], 70) - LO) * SPAN;
+      let g = (px[j + 1] * 250 / Math.max(bg[j + 1], 70) - LO) * SPAN;
+      let b = (px[j + 2] * 250 / Math.max(bg[j + 2], 70) - LO) * SPAN;
+      r = r < 0 ? 0 : r > 255 ? 255 : r;
+      g = g < 0 ? 0 : g > 255 ? 255 : g;
+      b = b < 0 ? 0 : b > 255 ? 255 : b;
+      // 3) pertegas warna (logo, stempel, tanda tangan)
+      const l = r * 0.3 + g * 0.59 + b * 0.11;
+      px[j] = l + (r - l) * SAT;
+      px[j + 1] = l + (g - l) * SAT;
+      px[j + 2] = l + (b - l) * SAT;
     }
     const src = new Uint8ClampedArray(px);
     const row = w * 4;
@@ -697,7 +758,7 @@
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     if (state.filter !== 'asli') {
       const d = ctx.getImageData(0, 0, c.width, c.height);
-      (state.filter === 'bw' ? filterBW : filterSharp)(d);
+      if (state.filter === 'bw') filterBW(d); else filterSharp(d, c);
       ctx.putImageData(d, 0, 0);
     }
     return c;
