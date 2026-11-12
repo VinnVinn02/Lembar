@@ -11,6 +11,10 @@
 
   const $ = (id) => document.getElementById(id);
   const el = {
+    home: $('home'), startScanBtn: $('startScanBtn'), importBtn: $('importBtn'),
+    recentDoc: $('recentDoc'), recentPreviewImg: $('recentPreviewImg'), recentTitle: $('recentTitle'),
+    recentMeta: $('recentMeta'), recentPages: $('recentPages'), homeEmpty: $('homeEmpty'),
+    allDocsBtn: $('allDocsBtn'), navDocsBtn: $('navDocsBtn'), homeBtn: $('homeBtn'),
     cam: $('cam'), res: $('res'), video: $('video'), overlay: $('overlay'), flash: $('flash'),
     status: $('status'), denied: $('denied'), pick: $('pick'), hint: $('hint'), hintClose: $('hintClose'),
     autoBtn: $('autoBtn'), shot: $('shot'), doneBtn: $('doneBtn'), count: $('count'),
@@ -22,7 +26,7 @@
     cropBtn: $('cropBtn'), crop: $('crop'), cropCanvas: $('cropCanvas'), cropCancel: $('cropCancel'), cropSave: $('cropSave')
   };
 
-  const state = { pages: [], filter: 'tajam', screen: 'cam', auto: true, nameEdited: false };
+  const state = { pages: [], filter: 'tajam', screen: 'home', auto: true, nameEdited: false };
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
@@ -72,6 +76,24 @@
     try { return JSON.parse(lsGet('meta')) || {}; } catch (e) { return {}; }
   }
 
+  function updateHome() {
+    const page = state.pages[0];
+    const hasPages = state.pages.length > 0;
+    el.recentDoc.hidden = !hasPages;
+    el.homeEmpty.hidden = hasPages;
+    if (!hasPages) return;
+
+    el.recentTitle.textContent = el.name.value.trim() || 'Dokumen hasil scan';
+    el.recentPages.textContent = `${state.pages.length} halaman`;
+    const timestamp = Number(String(page.id).split('-')[0]);
+    el.recentMeta.textContent = Number.isFinite(timestamp)
+      ? new Date(timestamp).toLocaleDateString('id-ID', { day: 'numeric', month: 'short', year: 'numeric' })
+      : 'Dokumen terbaru';
+    el.recentPreviewImg.hidden = !page.thumb;
+    el.recentPreviewImg.src = page.thumb || '';
+    el.recentPreviewImg.nextElementSibling.hidden = !!page.thumb;
+  }
+
   async function restorePages() {
     const meta = loadMeta();
     if (['asli', 'bw', 'tajam'].includes(meta.filter)) state.filter = meta.filter;
@@ -93,6 +115,7 @@
     }
     state.pages = old.concat(state.pages);
     updateCount(false);
+    updateHome();
   }
 
   let seq = 0;
@@ -103,6 +126,7 @@
     updateCount(true);
     saveMeta();
     persist(p);
+    updateHome();
   }
   // Simpan di latar belakang: jangan sampai penyimpanan yang macet menahan jepretan berikutnya.
   function persist(p) {
@@ -767,14 +791,20 @@
   // ---------- Layar hasil ----------
   function show(screen) {
     state.screen = screen;
+    el.home.hidden = screen !== 'home';
     el.cam.hidden = screen !== 'cam';
     el.res.hidden = screen !== 'res';
     if (screen === 'cam') {
       startCam();
     } else {
       stopCam();
-      if (!state.nameEdited || !el.name.value.trim()) { el.name.value = defaultName(); state.nameEdited = false; }
-      renderGrid();
+      if (screen === 'res') {
+        if (!state.nameEdited || !el.name.value.trim()) { el.name.value = defaultName(); state.nameEdited = false; }
+        renderGrid();
+      } else {
+        updateHome();
+        if (state.pages.length) refreshThumbs();
+      }
     }
   }
 
@@ -825,6 +855,7 @@
         p.key = key;
         const node = [...el.grid.children].find((n) => n.dataset.id === p.id);
         if (node) node.firstChild.src = p.thumb;
+        if (p === state.pages[0]) updateHome();
         if (sheetPage === p) el.sheetImg.src = p.thumb;
       } catch (e) { /* lewati */ }
     }
@@ -855,6 +886,7 @@
     updateCount(false);
     closeSheet();
     renderGrid();
+    updateHome();
   }
 
   // ---------- Atur sudut potong manual ----------
@@ -1165,6 +1197,7 @@
     saveMeta();
     updateCount(false);
     state.nameEdited = false;
+    updateHome();
     T.locked = false; T.lockSig = null; T.lockQuad = null;
     show('cam');
   }
@@ -1194,6 +1227,12 @@
     });
     el.doneBtn.addEventListener('click', () => show('res'));
     el.backBtn.addEventListener('click', () => show('cam'));
+    el.homeBtn.addEventListener('click', () => show('home'));
+    el.startScanBtn.addEventListener('click', () => show('cam'));
+    el.importBtn.addEventListener('click', () => el.pick.click());
+    el.recentDoc.addEventListener('click', () => show('res'));
+    el.allDocsBtn.addEventListener('click', () => show('res'));
+    el.navDocsBtn.addEventListener('click', () => show('res'));
     el.pick.addEventListener('change', () => {
       const files = [...el.pick.files];
       el.pick.value = '';
@@ -1209,7 +1248,7 @@
       saveMeta();
       refreshThumbs();
     });
-    el.name.addEventListener('input', () => { state.nameEdited = true; });
+    el.name.addEventListener('input', () => { state.nameEdited = true; updateHome(); });
     el.pdfBtn.addEventListener('click', () => exportAs('pdf'));
     el.zipBtn.addEventListener('click', () => exportAs('zip'));
     el.newBtn.addEventListener('click', newScan);
@@ -1236,7 +1275,7 @@
 
   function init() {
     bind();
-    show('cam');
+    show('home');
     restorePages();
     waitCv();
     iosHint();

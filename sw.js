@@ -1,6 +1,6 @@
 // Service worker Lembar: membuat app jalan offline setelah dibuka sekali.
 // Naikkan angka versi ini setiap kali mengganti daftar file di bawah.
-const CACHE = 'lembar-v6';
+const CACHE = 'lembar-v7';
 
 const LOCAL = [
   './',

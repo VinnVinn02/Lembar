@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
   <title>Lembar</title>
   <meta name="description" content="Scanner dokumen otomatis untuk HP. Semua diproses di perangkat.">
-  <meta name="theme-color" content="#0b0f14">
+  <meta name="theme-color" content="#f4f6f3">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -16,6 +16,82 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <input id="pick" type="file" accept="image/*" multiple hidden>
+
+  <!-- BERANDA -->
+  <main id="home" class="screen" hidden>
+    <header class="homeHeader">
+      <a class="brand" href="#" aria-label="Lembar, beranda">
+        <span class="brandMark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M7 3.75h7l4 4v12.5H7a2 2 0 0 1-2-2v-12.5a2 2 0 0 1 2-2Z"/><path d="M14 3.75v4h4M8.5 12h7M8.5 15.5h7"/></svg>
+        </span>
+        <span>Lembar</span>
+      </a>
+      <span class="profileBtn" aria-hidden="true">L</span>
+    </header>
+
+    <div class="homeScroll">
+      <section class="welcome">
+        <p class="eyebrow">RUANG DOKUMEN</p>
+        <h1>Semua dokumen,<br><span>lebih tertata.</span></h1>
+        <p class="welcomeCopy">Pindai kertas jadi dokumen digital yang rapi.</p>
+      </section>
+
+      <section class="scanActions" aria-label="Buat dokumen">
+        <button id="startScanBtn" class="scanAction">
+          <span class="actionIcon scanIcon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M8 4H5a1 1 0 0 0-1 1v3m12-4h3a1 1 0 0 1 1 1v3M4 16v3a1 1 0 0 0 1 1h3m12-4v3a1 1 0 0 1-1 1h-3M8 12h8"/></svg>
+          </span>
+          <span><b>Pindai dokumen</b><small>Gunakan kamera</small></span>
+          <span class="actionArrow" aria-hidden="true">→</span>
+        </button>
+        <button id="importBtn" class="scanAction importAction">
+          <span class="actionIcon importIcon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg>
+          </span>
+          <span><b>Impor dari galeri</b><small>Pilih foto atau gambar</small></span>
+          <span class="actionArrow" aria-hidden="true">→</span>
+        </button>
+      </section>
+
+      <section class="recentSection">
+        <div class="sectionHeading">
+          <div>
+            <p class="eyebrow">PUSTAKA</p>
+            <h2>Baru-baru ini</h2>
+          </div>
+          <button id="allDocsBtn" class="textAction">Lihat</button>
+        </div>
+        <button id="recentDoc" class="recentDoc" hidden>
+          <span class="recentPreview"><img id="recentPreviewImg" alt="" hidden><span class="previewPlaceholder" aria-hidden="true">▤</span></span>
+          <span class="recentInfo">
+            <b id="recentTitle">Dokumen baru</b>
+            <small id="recentMeta">Belum tersimpan</small>
+            <span class="recentTag"><i></i><span id="recentPages">0 halaman</span></span>
+          </span>
+          <span class="recentArrow" aria-hidden="true">›</span>
+        </button>
+        <div id="homeEmpty" class="homeEmpty">
+          <span class="emptyIllustration" aria-hidden="true">
+            <svg viewBox="0 0 72 72"><path d="M20 11h22l12 12v37H20a5 5 0 0 1-5-5V16a5 5 0 0 1 5-5Z"/><path d="M42 11v13h12M25 35h24M25 43h19M25 51h14"/></svg>
+          </span>
+          <b>Belum ada dokumen</b>
+          <span>Dokumen hasil scan akan muncul di sini.</span>
+        </div>
+      </section>
+    </div>
+
+    <nav class="bottomNav" aria-label="Navigasi utama">
+      <button class="navItem active" aria-current="page">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3.5 10 8.5-7 8.5 7v9a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2v-9Z"/><path d="M9 21v-8h6v8"/></svg>
+        <span>Beranda</span>
+      </button>
+      <button id="navDocsBtn" class="navItem">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3.75h7l4 4v12.5H7a2 2 0 0 1-2-2v-12.5a2 2 0 0 1 2-2Z"/><path d="M14 3.75v4h4M8.5 12h7M8.5 15.5h7"/></svg>
+        <span>Dokumen</span>
+      </button>
+    </nav>
+  </main>
 
   <!-- LAYAR 1: KAMERA -->
   <main id="cam" class="screen">
@@ -26,9 +102,8 @@
 
     <div id="denied" class="card" hidden>
       <p><b>Kamera tidak bisa dibuka.</b><br>Izinkan kamera di pengaturan browser, atau pilih foto dari galeri.</p>
-      <label class="btn primary">
+      <label for="pick" class="btn primary">
         Pilih foto dari galeri
-        <input id="pick" type="file" accept="image/*" multiple hidden>
       </label>
     </div>
 
@@ -55,6 +130,7 @@
     <header>
       <button id="backBtn" aria-label="Kembali ke kamera">‹ Kamera</button>
       <h1 id="title">Hasil</h1>
+      <button id="homeBtn" aria-label="Kembali ke beranda">Beranda</button>
     </header>
 
     <div id="grid"></div>
